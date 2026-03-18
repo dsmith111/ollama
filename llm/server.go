@@ -144,17 +144,30 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 	var llamaModel *llama.Model
 	var tok tokenizer.Tokenizer
 	var err error
-	if envconfig.NewEngine() || f.KV().OllamaEngineRequired() {
+	accelMode := envconfig.AccelMode()
+	assistRequested := accelMode == "npu_assist"
+	if envconfig.NewEngine() || f.KV().OllamaEngineRequired() || assistRequested {
 		if len(projectors) == 0 {
 			tok, err = model.NewTextProcessor(modelPath)
 		} else {
 			err = errors.New("split vision models aren't supported")
 		}
 		if err != nil {
+			if assistRequested && envconfig.NPUStrict(false) {
+				return nil, fmt.Errorf("OLLAMA_ACCEL_MODE=npu_assist with OLLAMA_NPU_STRICT=1 requires the Ollama engine path for this model: %w", err)
+			}
 			// To prepare for opt-out mode, instead of treating this as an error, we fallback to the old runner
-			slog.Debug("model not yet supported by Ollama engine, switching to compatibility mode", "model", modelPath, "error", err)
+			slog.Warn("model not yet supported by Ollama engine, switching to compatibility mode", "model", modelPath, "error", err)
 		}
 	}
+
+	if assistRequested && tok == nil {
+		if envconfig.NPUStrict(false) {
+			return nil, fmt.Errorf("OLLAMA_ACCEL_MODE=npu_assist with OLLAMA_NPU_STRICT=1 cannot use compatibility llama runner; Ollama engine is required")
+		}
+		slog.Warn("OLLAMA_ACCEL_MODE=npu_assist requested but compatibility llama runner does not support draft speculation; running without NPU assist", "model", modelPath)
+	}
+
 	if tok == nil {
 		llamaModel, err = llama.LoadModelFromFile(modelPath, llama.ModelParams{VocabOnly: true})
 		if err != nil {
@@ -1530,6 +1543,11 @@ type CompletionResponse struct {
 
 	// TotalSteps is the total number of steps for image generation
 	TotalSteps int `json:"total_steps,omitempty"`
+
+	// NPU speculative decoding stats (emitted when OLLAMA_NPU_STATS=1)
+	NPUDraftProposed int64   `json:"npu_draft_proposed,omitempty"`
+	NPUDraftAccepted int64   `json:"npu_draft_accepted,omitempty"`
+	NPUAcceptRate    float64 `json:"npu_accept_rate,omitempty"`
 }
 
 func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn func(CompletionResponse)) error {

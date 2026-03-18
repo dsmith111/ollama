@@ -75,6 +75,15 @@ func (c *InputCache) Close() {
 	}
 }
 
+// TruncateSlot removes KV cache entries from position 'from' onwards for a given slot.
+// Used by speculative decoding to discard rejected draft tokens from the backend cache.
+func (c *InputCache) TruncateSlot(slot *InputCacheSlot, from int32) error {
+	if c == nil || c.cache == nil {
+		return nil
+	}
+	return c.cache.Remove(slot.Id, from, math.MaxInt32)
+}
+
 // Locking: Operations on InputCacheSlot (including finding one
 // through LoadCacheSlot) require a lock to be held that serializes
 // these operations with each other and processBatch

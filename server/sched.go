@@ -222,6 +222,34 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						slog.Debug("updating default concurrency", "OLLAMA_MAX_LOADED_MODELS", maxRunners, "gpu_count", len(gpus))
 					}
 
+					// NPU acceleration validation
+					accelMode := envconfig.AccelMode()
+					if accelMode == "npu" || accelMode == "npu_assist" {
+						npuStatus, npuErr := ValidateNPU(envconfig.NPUDeviceID())
+						if npuErr != nil {
+							if accelMode == "npu" && envconfig.NPUStrict(false) {
+								slog.Error("NPU validation failed (strict mode)", "error", npuErr)
+								pending.errCh <- fmt.Errorf("OLLAMA_ACCEL_MODE=%s but NPU unavailable: %w", accelMode, npuErr)
+								break
+							}
+
+							if accelMode == "npu_assist" {
+								slog.Warn("NPU preflight validation failed for npu_assist; draft runner startup enforces strict mode",
+									"error", npuErr)
+							} else {
+								slog.Warn("NPU validation failed, falling back to default device",
+									"accel_mode", accelMode, "error", npuErr)
+							}
+						} else {
+							slog.Info("NPU validated for acceleration",
+								"accel_mode", accelMode,
+								"adapter", npuStatus.AdapterIdx,
+								"description", npuStatus.Description,
+								"d3d12", npuStatus.HasD3D12,
+								"dml", npuStatus.HasDML)
+						}
+					}
+
 					// Check for image generation models - all use MLX runner
 					if slices.Contains(pending.model.Config.Capabilities, "image") {
 						if s.loadMLX(pending) {
@@ -241,8 +269,30 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						}
 					}
 
+					// Check for GenAI-QNN model bundles (Snapdragon NPU)
+					if pending.model.IsGenAIQNN() {
+						slog.Info("GenAI-QNN model detected, routing to ORT GenAI with QNN provider")
+						if s.loadORTGenAIQNN(pending) {
+							break
+						}
+						continue
+					}
+
 					// Check for ONNX models — use ORT GenAI runner for NPU/GPU inference
 					if pending.model.IsONNX() {
+						// If NPU acceleration is requested, route with NPU targeting
+						if accelMode == "npu" || accelMode == "npu_assist" {
+							slog.Info("NPU acceleration requested for ONNX model, targeting NPU",
+								"accel_mode", accelMode)
+							if s.loadORTGenAINPU(pending) {
+								break
+							}
+							if envconfig.NPUStrict(false) {
+								pending.errCh <- fmt.Errorf("OLLAMA_ACCEL_MODE=%s but NPU ORT load failed", accelMode)
+								break
+							}
+							slog.Warn("NPU ORT load failed, falling back to default ORT path")
+						}
 						if s.loadORTGenAI(pending) {
 							break
 						}
@@ -258,9 +308,16 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						continue
 					}
 
+					// For GGUF models with NPU acceleration: ensure DirectML is enabled
+					if (accelMode == "npu" || accelMode == "npu_assist") && !envconfig.EnableDirectML() {
+						slog.Info("OLLAMA_ACCEL_MODE requires DirectML, enabling implicitly",
+							"accel_mode", accelMode)
+						os.Setenv("OLLAMA_DIRECTML", "1")
+					}
+
 					// Load model for fitting
 					logutil.Trace("loading model metadata", "model", pending.model.ModelPath)
-					ggml, err := llm.LoadModel(pending.model.ModelPath, 1024)
+					_, err := llm.LoadModel(pending.model.ModelPath, 1024)
 					if err != nil {
 						pending.errCh <- err
 						break
@@ -592,6 +649,13 @@ iGPUScan:
 		pid:             llama.Pid(),
 	}
 	runner.numParallel = numParallel
+
+	// NPU telemetry
+	slog.Info("model loaded on device(s)",
+		"model", req.model.ShortName,
+		"accel_mode", envconfig.AccelMode(),
+		"gpu_ids", gpuIDs)
+
 	runner.refMu.Lock() // hold lock until running or aborted
 
 	s.loadedMu.Lock()
@@ -730,6 +794,69 @@ func (s *Scheduler) loadORTGenAIFromDir(req *LlmRequest, modelDir string) bool {
 	}
 	runner.refMu.Unlock()
 
+	req.useLoadedRunner(runner, s.finishedReqCh)
+	return true
+}
+
+// loadORTGenAINPU loads an ONNX model targeting the NPU via DML device_filter.
+func (s *Scheduler) loadORTGenAINPU(req *LlmRequest) bool {
+	return s.loadORTGenAIWithOpts(req, req.model.ModelPath, ortrunner.ClientOptions{
+		ModelDir:   req.model.ModelPath,
+		DeviceType: "npu",
+		DeviceID:   envconfig.NPUDeviceID(),
+	})
+}
+
+// loadORTGenAIQNN loads a GenAI-QNN model bundle using the QNN execution provider.
+func (s *Scheduler) loadORTGenAIQNN(req *LlmRequest) bool {
+	return s.loadORTGenAIWithOpts(req, req.model.ModelPath, ortrunner.ClientOptions{
+		ModelDir: req.model.ModelPath,
+		Provider: "qnn",
+	})
+}
+
+// loadORTGenAIWithOpts loads an ONNX model with explicit device/provider options.
+func (s *Scheduler) loadORTGenAIWithOpts(req *LlmRequest, modelDir string, opts ortrunner.ClientOptions) bool {
+	opts.ModelDir = modelDir
+	server, err := ortrunner.NewClientWithOpts(opts)
+	if err != nil {
+		req.errCh <- err
+		return true
+	}
+
+	sessionDuration := envconfig.KeepAlive()
+	if req.sessionDuration != nil {
+		sessionDuration = req.sessionDuration.Duration
+	}
+
+	totalSize, vramSize := server.MemorySize()
+	runner := &runnerRef{
+		model:           req.model,
+		modelPath:       modelDir,
+		modelKey:        schedulerModelKey(req.model),
+		llama:           server,
+		Options:         &req.opts,
+		loading:         false,
+		sessionDuration: sessionDuration,
+		totalSize:       totalSize,
+		vramSize:        vramSize,
+	}
+
+	s.loadedMu.Lock()
+	s.loaded[runner.modelKey] = runner
+	s.loadedMu.Unlock()
+
+	runner.refMu.Lock()
+	if sessionDuration > 0 {
+		runner.expireTimer = time.AfterFunc(sessionDuration, func() {
+			s.expiredCh <- runner
+		})
+	}
+	runner.refMu.Unlock()
+
+	slog.Info("ORT GenAI model loaded with options",
+		"model", modelDir, "device_type", opts.DeviceType,
+		"device_id", opts.DeviceID, "provider", opts.Provider)
 	req.useLoadedRunner(runner, s.finishedReqCh)
 	return true
 }

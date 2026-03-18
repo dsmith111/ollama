@@ -211,6 +211,16 @@ var (
 	EnableVulkan = Bool("OLLAMA_VULKAN")
 	// Enable DirectML backend for NPU/GPU acceleration
 	EnableDirectML = Bool("OLLAMA_DIRECTML")
+	// NPU acceleration mode: "off", "npu", "npu_assist"
+	AccelMode = String("OLLAMA_ACCEL_MODE")
+	// NPU device index for DXCore adapter selection
+	NPUDeviceID = String("OLLAMA_NPU_DEVICE_ID")
+	// Strict NPU mode: error instead of warn when NPU unavailable
+	NPUStrict = BoolWithDefault("OLLAMA_NPU_STRICT")
+	// Path to ONNX draft model for speculative decoding
+	DraftModel = String("OLLAMA_DRAFT_MODEL")
+	// Number of draft tokens per speculative decode iteration (default 5)
+	DraftK = Uint("OLLAMA_DRAFT_K", 5)
 	// NoCloudEnv checks the OLLAMA_NO_CLOUD environment variable.
 	NoCloudEnv = Bool("OLLAMA_NO_CLOUD")
 )

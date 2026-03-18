@@ -157,6 +157,136 @@ func NewClient(modelDir string) (*Client, error) {
 	return c, nil
 }
 
+// ClientOptions provides explicit device/provider configuration for the ORT GenAI subprocess.
+// This avoids thread-unsafe os.Setenv by passing config through the subprocess environment.
+type ClientOptions struct {
+	ModelDir   string // Path to ONNX model directory
+	DeviceType string // "npu" or "gpu" — sets OLLAMA_ORT_DEVICE_TYPE
+	DeviceID   string // Explicit device index — sets OLLAMA_ORT_DEVICE_ID
+	Provider   string // "dml", "qnn", or "cpu" — sets OLLAMA_ONNX_PROVIDER
+}
+
+// NewClientWithOpts spawns a new ORT GenAI runner subprocess with explicit device options.
+func NewClientWithOpts(opts ClientOptions) (*Client, error) {
+	// Find a free port
+	port := 0
+	if a, err := net.ResolveTCPAddr("tcp", "localhost:0"); err == nil {
+		if l, err := net.ListenTCP("tcp", a); err == nil {
+			port = l.Addr().(*net.TCPAddr).Port
+			l.Close()
+		}
+	}
+	if port == 0 {
+		port = rand.Intn(65535-49152) + 49152
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("unable to lookup executable path: %w", err)
+	}
+	if eval, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = eval
+	}
+
+	cmd := exec.Command(exe, "runner", "--ortgenai-engine", "--model", opts.ModelDir, "--port", strconv.Itoa(port))
+	cmd.Env = os.Environ()
+
+	// Inject device/provider options into subprocess env
+	if opts.DeviceType != "" {
+		cmd.Env = append(cmd.Env, "OLLAMA_ORT_DEVICE_TYPE="+opts.DeviceType)
+	}
+	if opts.DeviceID != "" {
+		cmd.Env = append(cmd.Env, "OLLAMA_ORT_DEVICE_ID="+opts.DeviceID)
+	}
+	if opts.Provider != "" {
+		cmd.Env = append(cmd.Env, "OLLAMA_ONNX_PROVIDER="+opts.Provider)
+	}
+
+	// Add ORT GenAI library paths (same as NewClient)
+	var libPathEnvVar string
+	switch runtime.GOOS {
+	case "linux":
+		libPathEnvVar = "LD_LIBRARY_PATH"
+	case "windows":
+		libPathEnvVar = "PATH"
+	}
+
+	if libPathEnvVar != "" {
+		var libraryPaths []string
+		if ortPath, ok := os.LookupEnv("OLLAMA_ORT_PATH"); ok {
+			libraryPaths = append(libraryPaths, filepath.SplitList(ortPath)...)
+		}
+		if ml.LibOllamaPath != "" {
+			libraryPaths = append(libraryPaths, ml.LibOllamaPath)
+			if ortDirs, err := filepath.Glob(filepath.Join(ml.LibOllamaPath, "ortgenai*")); err == nil {
+				libraryPaths = append(libraryPaths, ortDirs...)
+			}
+		}
+		if existingPath, ok := os.LookupEnv(libPathEnvVar); ok {
+			libraryPaths = append(libraryPaths, filepath.SplitList(existingPath)...)
+		}
+		pathEnvVal := strings.Join(libraryPaths, string(filepath.ListSeparator))
+		found := false
+		for i := range cmd.Env {
+			envName := cmd.Env[i]
+			if runtime.GOOS == "windows" {
+				envName = strings.ToUpper(envName)
+			}
+			if strings.HasPrefix(envName, libPathEnvVar+"=") {
+				cmd.Env[i] = libPathEnvVar + "=" + pathEnvVal
+				found = true
+				break
+			}
+		}
+		if !found {
+			cmd.Env = append(cmd.Env, libPathEnvVar+"="+pathEnvVal)
+		}
+	}
+
+	c := &Client{
+		port:     port,
+		modelDir: opts.ModelDir,
+		done:     make(chan error, 1),
+		client:   &http.Client{Timeout: 10 * time.Minute},
+		cmd:      cmd,
+	}
+
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	go func() {
+		io.Copy(os.Stderr, stdout) //nolint:errcheck
+	}()
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			fmt.Fprintln(os.Stderr, line)
+			c.lastErrLk.Lock()
+			c.lastErr = line
+			c.lastErrLk.Unlock()
+		}
+	}()
+
+	slog.Info("starting ortgenai runner subprocess with opts",
+		"exe", exe, "model", opts.ModelDir, "port", port,
+		"device_type", opts.DeviceType, "device_id", opts.DeviceID, "provider", opts.Provider)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start ortgenai runner: %w", err)
+	}
+
+	go func() {
+		err := cmd.Wait()
+		c.done <- err
+	}()
+
+	if err := c.waitUntilRunning(); err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	return c, nil
+}
+
 func (c *Client) getLastErr() string {
 	c.lastErrLk.Lock()
 	defer c.lastErrLk.Unlock()

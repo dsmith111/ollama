@@ -2320,6 +2320,16 @@ func NewCLI() *cobra.Command {
 		}
 	}
 
+	debugCmd := &cobra.Command{
+		Use:   "debug",
+		Short: "Diagnostic tools",
+	}
+	debugCmd.AddCommand(&cobra.Command{
+		Use:   "npu",
+		Short: "Show NPU adapter information",
+		RunE:  DebugNPUHandler,
+	})
+
 	rootCmd.AddCommand(
 		serveCmd,
 		createCmd,
@@ -2337,6 +2347,7 @@ func NewCLI() *cobra.Command {
 		copyCmd,
 		deleteCmd,
 		runnerCmd,
+		debugCmd,
 		launch.LaunchCmd(checkServerHeartbeat, runInteractiveTUI),
 	)
 

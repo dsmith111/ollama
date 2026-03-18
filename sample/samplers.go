@@ -69,6 +69,11 @@ func (s *Sampler) Sample(logits []float32) (int32, error) {
 	return t.id, nil
 }
 
+// IsGreedy returns true if the sampler uses greedy (argmax) sampling (temperature == 0).
+func (s *Sampler) IsGreedy() bool {
+	return s.temperature == 0
+}
+
 // greedy returns the highest probability token from the tokens
 func greedy(tokens []token) token {
 	max := tokens[0]

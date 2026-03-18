@@ -113,6 +113,12 @@ type Sequence struct {
 	samplingDuration         time.Duration
 	numPredicted             int
 	numPromptInputs          int
+
+	// Speculative decoding state
+	specVerifying    bool    // true when this sequence is in verification mode
+	specDraftTokens  []int32 // draft tokens being verified
+	specFirstOutput  int     // index of first output in batch for this seq during verification
+	specDraftInited  bool    // true once draft session has been initialized for this prompt
 }
 
 type NewSequenceParams struct {
@@ -385,6 +391,9 @@ type Server struct {
 	// multimodalHash generates hashes for comparing equality
 	// of non-text data
 	multimodalHash maphash.Hash
+
+	// specDecoder manages NPU-assisted speculative decoding (nil if disabled)
+	specDecoder *SpeculativeDecoder
 }
 
 func (s *Server) allNil() bool {
@@ -586,7 +595,15 @@ func (s *Server) forwardBatch(pendingBatch batchState) (nextBatch batchState, er
 			batch.Sequences = append(batch.Sequences, seq.cache.Id)
 
 			seq.iBatch = len(batchOutputs)
-			if i+1 == len(seq.inputs) || seq.embeddingOnly {
+			needOutput := i+1 == len(seq.inputs) || seq.embeddingOnly
+			// When spec verifying, output logits at every position for batch verification
+			if seq.specVerifying {
+				needOutput = true
+				if i == 0 {
+					seq.specFirstOutput = len(batchOutputs)
+				}
+			}
+			if needOutput {
 				batchOutputs = append(batchOutputs, int32(len(batchInputs)-1))
 			}
 			logutil.Trace("forwardBatch iBatch", "batchID", s.batchID, "seqIdx", seqIdx, "seq.iBatch", seq.iBatch, "i+1", i+1, "len(seq.inputs)", len(seq.inputs))
@@ -739,6 +756,105 @@ func (s *Server) computeBatch(activeBatch batchState) {
 			continue
 		}
 
+		// --- Speculative decode: verification pass ---
+		if seq.specVerifying && len(seq.specDraftTokens) > 0 {
+			vocabSize := len(outputs) / activeBatch.batch.Outputs.Dim(0)
+			draftTokens := seq.specDraftTokens
+			firstOut := seq.specFirstOutput
+
+			// Collect logits for each draft position + 1 (the correction position)
+			numPositions := len(draftTokens) + 1
+			if firstOut+numPositions > activeBatch.batch.Outputs.Dim(0) {
+				numPositions = activeBatch.batch.Outputs.Dim(0) - firstOut
+			}
+			logitsPerPos := make([][]float32, numPositions)
+			for j := 0; j < numPositions; j++ {
+				outIdx := firstOut + j
+				logitsPerPos[j] = outputs[outIdx*vocabSize : (outIdx+1)*vocabSize]
+			}
+
+			acceptCount, correctionToken := VerifyGreedy(draftTokens, logitsPerPos)
+
+			// Notify draft model of accept result
+			if s.specDecoder != nil {
+				s.specDecoder.AcceptDraftTokens(acceptCount, len(draftTokens), correctionToken)
+			}
+
+			// Process accepted tokens: decode and send responses
+			for j := 0; j < acceptCount; j++ {
+				token := draftTokens[j]
+				if s.model.(tokenizer.Tokenizer).Is(token, tokenizer.SpecialEOS) {
+					s.removeSequence(i, llm.DoneReasonStop)
+					break
+				}
+				piece, err := s.model.(tokenizer.Tokenizer).Decode([]int32{token})
+				if err != nil {
+					slog.Warn("speculative decode: failed to decode token", "error", err)
+					continue
+				}
+				seq.numPredicted++
+				seq.pendingResponses = append(seq.pendingResponses, piece)
+			}
+
+			// Process the correction token (the main model's actual next token)
+			if seq.doneReason == 0 && correctionToken != 0 {
+				if s.model.(tokenizer.Tokenizer).Is(correctionToken, tokenizer.SpecialEOS) {
+					s.removeSequence(i, llm.DoneReasonStop)
+				} else {
+					piece, err := s.model.(tokenizer.Tokenizer).Decode([]int32{correctionToken})
+					if err == nil {
+						seq.numPredicted++
+						seq.pendingResponses = append(seq.pendingResponses, piece)
+					}
+					nextBatchTokens[i].Token = correctionToken
+				}
+			}
+
+			// Truncate KV cache for rejected draft tokens
+			rejectCount := len(draftTokens) - acceptCount
+			if rejectCount > 0 {
+				newLen := int32(len(seq.cache.Inputs) - rejectCount)
+				if newLen < 0 {
+					newLen = 0
+				}
+				seq.cache.Inputs = seq.cache.Inputs[:newLen]
+				if err := s.cache.TruncateSlot(seq.cache, newLen); err != nil {
+					slog.Warn("speculative decode: failed to truncate KV cache", "error", err)
+				}
+			}
+
+			// Reset verification state
+			seq.specVerifying = false
+			seq.specDraftTokens = nil
+			seq.specFirstOutput = 0
+
+			// Flush pending responses
+			if seq.doneReason == 0 {
+				sequence := strings.Join(seq.pendingResponses, "")
+				if ok, stop := common.FindStop(sequence, seq.stop); ok {
+					var tokenTruncated bool
+					seq.pendingResponses, tokenTruncated = common.TruncateStop(seq.pendingResponses, stop)
+					tokenLen := len(seq.cache.Inputs) + 1
+					tokenLen -= len(seq.pendingResponses)
+					if tokenTruncated {
+						tokenLen--
+					}
+					if tokenLen > 0 && tokenLen <= len(seq.cache.Inputs) {
+						seq.cache.Inputs = seq.cache.Inputs[:tokenLen]
+					}
+					s.removeSequence(i, llm.DoneReasonStop)
+				} else if !common.ContainsStopSuffix(sequence, seq.stop) && !common.IncompleteUnicode(sequence) {
+					if !flushPending(seq) {
+						s.removeSequence(i, llm.DoneReasonConnectionClosed)
+					}
+				}
+			}
+
+			slog.Debug("speculative decode verification complete",
+				"accepted", acceptCount, "proposed", len(draftTokens), "correction", correctionToken)
+			continue
+		}
+
 		seq.lastUpdatedAt = t
 		seq.numPredicted++
 		if seq.numPredicted == 1 {
@@ -843,6 +959,42 @@ func (s *Server) computeBatch(activeBatch batchState) {
 
 		if !flushPending(seq) {
 			s.removeSequence(i, llm.DoneReasonConnectionClosed)
+		}
+
+		// --- Speculative decode: propose draft tokens for next iteration ---
+		if s.specDecoder != nil && s.specDecoder.IsEnabled() && !seq.specVerifying && !seq.embeddingOnly &&
+			len(seq.inputs) == 1 && seq.doneReason == 0 && seq.sampler.IsGreedy() &&
+			s.specDecoder.draftK+1 <= s.batchSize {
+
+			// Initialize draft session on first generation step
+			if !seq.specDraftInited {
+				// Use the original prompt text via tokenizer
+				// For simplicity, decode the cached tokens back to text
+				cachedTokenIDs := make([]int32, len(seq.cache.Inputs))
+				for ci, inp := range seq.cache.Inputs {
+					cachedTokenIDs[ci] = inp.Token
+				}
+				promptText, decErr := s.model.(tokenizer.Tokenizer).Decode(cachedTokenIDs)
+				if decErr == nil {
+					if initErr := s.specDecoder.InitDraftSession(promptText); initErr != nil {
+						slog.Warn("speculative decode: failed to init draft session", "error", initErr)
+					} else {
+						seq.specDraftInited = true
+					}
+				}
+			}
+
+			if seq.specDraftInited {
+				draftTokens, propErr := s.specDecoder.ProposeDraftTokens()
+				if propErr == nil && len(draftTokens) > 0 {
+					// Inject draft tokens into seq.inputs for batch verification
+					for _, dt := range draftTokens {
+						seq.inputs = append(seq.inputs, &input.Input{Token: dt})
+					}
+					seq.specVerifying = true
+					seq.specDraftTokens = draftTokens
+				}
+			}
 		}
 	}
 
@@ -1239,6 +1391,10 @@ func (s *Server) allocModel(
 
 // closeModel frees all memory associated with a model
 func (s *Server) closeModel() {
+	if s.specDecoder != nil {
+		s.specDecoder.Close()
+		s.specDecoder = nil
+	}
 	s.cache.Close()
 	s.cache = nil
 	if s.model != nil {
@@ -1260,6 +1416,11 @@ func (s *Server) loadModel() {
 
 	s.status = llm.ServerStatusReady
 	s.ready.Done()
+
+	// Initialize speculative decoder if a draft model is configured
+	if draftModel := envconfig.DraftModel(); draftModel != "" {
+		s.specDecoder = NewSpeculativeDecoder(draftModel)
+	}
 }
 
 // load is the handler called by the Ollama server to process different

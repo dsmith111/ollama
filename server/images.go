@@ -79,6 +79,10 @@ func (m *Model) IsONNX() bool {
 	return m.Config.ModelFormat == "onnx"
 }
 
+func (m *Model) IsGenAIQNN() bool {
+	return m.Config.ModelFormat == "genai-qnn"
+}
+
 // Capabilities returns the capabilities that the model supports
 func (m *Model) Capabilities() []model.Capability {
 	capabilities := []model.Capability{}
