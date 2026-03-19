@@ -225,28 +225,57 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					// NPU acceleration validation
 					accelMode := envconfig.AccelMode()
 					if accelMode == "npu" || accelMode == "npu_assist" {
-						npuStatus, npuErr := ValidateNPU(envconfig.NPUDeviceID())
-						if npuErr != nil {
-							if accelMode == "npu" && envconfig.NPUStrict(false) {
-								slog.Error("NPU validation failed (strict mode)", "error", npuErr)
-								pending.errCh <- fmt.Errorf("OLLAMA_ACCEL_MODE=%s but NPU unavailable: %w", accelMode, npuErr)
-								break
-							}
+						provider := os.Getenv("OLLAMA_ONNX_PROVIDER")
 
-							if accelMode == "npu_assist" {
-								slog.Warn("NPU preflight validation failed for npu_assist; draft runner startup enforces strict mode",
-									"error", npuErr)
+						// Determine which NPU path to validate based on provider config
+						// and NPU capabilities
+						npuStatus, npuErr := ValidateNPU(envconfig.NPUDeviceID())
+						isQNNPath := provider == "qnn" || npuStatus.GenericML
+
+						if isQNNPath {
+							// QNN path validation: only needs NPU to exist, not D3D12
+							qnnStatus, qnnErr := ValidateNPUForOrtQNN(envconfig.NPUDeviceID())
+							if qnnErr != nil {
+								if accelMode == "npu" && envconfig.NPUStrict(false) {
+									slog.Error("NPU validation failed for QNN path (strict mode)", "error", qnnErr)
+									pending.errCh <- fmt.Errorf("OLLAMA_ACCEL_MODE=%s but no QNN-capable NPU found: %w", accelMode, qnnErr)
+									break
+								}
+								slog.Warn("NPU QNN validation failed, will attempt anyway",
+									"accel_mode", accelMode, "error", qnnErr)
 							} else {
-								slog.Warn("NPU validation failed, falling back to default device",
-									"accel_mode", accelMode, "error", npuErr)
+								slog.Info("NPU validated for QNN path acceleration",
+									"accel_mode", accelMode, "provider", provider,
+									"adapter", qnnStatus.AdapterIdx, "description", qnnStatus.Description)
+							}
+							if npuErr != nil {
+								slog.Info("NPU D3D12 validation failed (expected for QNN/Snapdragon path)",
+									"description", npuStatus.Description, "error", npuErr)
 							}
 						} else {
-							slog.Info("NPU validated for acceleration",
-								"accel_mode", accelMode,
-								"adapter", npuStatus.AdapterIdx,
-								"description", npuStatus.Description,
-								"d3d12", npuStatus.HasD3D12,
-								"dml", npuStatus.HasDML)
+							// D3D12/DML path validation
+							d3d12Status, d3d12Err := ValidateNPUForD3D12(envconfig.NPUDeviceID())
+							if d3d12Err != nil {
+								if accelMode == "npu" && envconfig.NPUStrict(false) {
+									slog.Error("NPU validation failed for D3D12/DML path (strict mode)", "error", d3d12Err)
+									pending.errCh <- fmt.Errorf("OLLAMA_ACCEL_MODE=%s but NPU unavailable for D3D12/DML: %w", accelMode, d3d12Err)
+									break
+								}
+								if accelMode == "npu_assist" {
+									slog.Warn("NPU preflight validation failed for npu_assist (D3D12/DML path)",
+										"error", d3d12Err)
+								} else {
+									slog.Warn("NPU D3D12/DML validation failed, falling back to default device",
+										"accel_mode", accelMode, "error", d3d12Err)
+								}
+							} else {
+								slog.Info("NPU validated for D3D12/DML acceleration",
+									"accel_mode", accelMode,
+									"adapter", d3d12Status.AdapterIdx,
+									"description", d3d12Status.Description,
+									"d3d12", d3d12Status.HasD3D12,
+									"dml", d3d12Status.HasDML)
+							}
 						}
 					}
 
@@ -798,13 +827,28 @@ func (s *Scheduler) loadORTGenAIFromDir(req *LlmRequest, modelDir string) bool {
 	return true
 }
 
-// loadORTGenAINPU loads an ONNX model targeting the NPU via DML device_filter.
+// loadORTGenAINPU loads an ONNX model targeting the NPU.
+// Prefers QNN provider (Snapdragon Hexagon HTP) if OLLAMA_ONNX_PROVIDER=qnn or if
+// QNN provider DLLs are available. Falls back to DML with NPU device filter otherwise.
 func (s *Scheduler) loadORTGenAINPU(req *LlmRequest) bool {
-	return s.loadORTGenAIWithOpts(req, req.model.ModelPath, ortrunner.ClientOptions{
+	provider := os.Getenv("OLLAMA_ONNX_PROVIDER")
+	if provider == "" {
+		// Auto-detect: the runner subprocess will do full DLL detection,
+		// but give it a hint via "qnn" if the user hasn't set a preference
+		// and the NPU is Snapdragon (Generic ML-only, no D3D12).
+		npuStatus, _ := ValidateNPU(envconfig.NPUDeviceID())
+		if npuStatus.GenericML {
+			provider = "qnn"
+		}
+	}
+
+	opts := ortrunner.ClientOptions{
 		ModelDir:   req.model.ModelPath,
 		DeviceType: "npu",
 		DeviceID:   envconfig.NPUDeviceID(),
-	})
+		Provider:   provider,
+	}
+	return s.loadORTGenAIWithOpts(req, req.model.ModelPath, opts)
 }
 
 // loadORTGenAIQNN loads a GenAI-QNN model bundle using the QNN execution provider.

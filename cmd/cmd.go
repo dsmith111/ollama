@@ -2329,6 +2329,11 @@ func NewCLI() *cobra.Command {
 		Short: "Show NPU adapter information",
 		RunE:  DebugNPUHandler,
 	})
+	debugCmd.AddCommand(&cobra.Command{
+		Use:   "ortgenai",
+		Short: "Show ORT GenAI runtime environment and provider diagnostics",
+		RunE:  DebugORTGenAIHandler,
+	})
 
 	rootCmd.AddCommand(
 		serveCmd,

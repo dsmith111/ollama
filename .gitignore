@@ -15,3 +15,18 @@ __debug_bin*
 llama/build
 llama/vendor
 /ollama
+
+# NuGet / ORT GenAI dependency cache
+.deps/
+
+# Runtime DLLs (ORT, QNN, DirectML) extracted for local dev
+lib/ollama/ortgenai/
+lib/ollama/*.dll
+
+# Local logs
+*.log
+
+# Compiled tool binaries (source is tracked, binaries are not)
+_tools/*.exe
+_tools/*.obj
+_tools/*.pdb

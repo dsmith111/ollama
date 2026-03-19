@@ -32,7 +32,8 @@ func NewDraftClient(modelDir string) (*DraftClient, error) {
 	deviceID := os.Getenv("OLLAMA_NPU_DEVICE_ID")
 	provider := os.Getenv("OLLAMA_ONNX_PROVIDER")
 	if provider == "" {
-		provider = "dml"
+		// Auto-detect best provider for NPU draft models
+		provider = detectBestProvider()
 	}
 
 	inner, err := NewClientWithOpts(ClientOptions{

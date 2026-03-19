@@ -153,10 +153,14 @@ This requires a QNN-specific ONNX model (not the same as DirectML models).
 |---|---|---|
 | `OLLAMA_ORT_PATH` | `lib/ollama/ortgenai` | Directory containing ORT GenAI DLLs |
 | `OLLAMA_ONNX_MODEL` | *(none)* | Path to ONNX model directory; overrides normal model routing |
-| `OLLAMA_ONNX_PROVIDER` | `dml` | Execution provider: `dml`, `qnn`, `cpu`, or any ORT EP name |
+| `OLLAMA_ONNX_PROVIDER` | *(auto-detect)* | Execution provider: `dml`, `qnn`, `cpu`, or any ORT EP name. Auto-detects QNN if `onnxruntime_providers_qnn.dll` is found. |
 | `OLLAMA_ORT_DEVICE_TYPE` | *(none)* | Device filter: `npu` or `gpu` (DML only) |
 | `OLLAMA_ORT_DEVICE_ID` | *(none)* | Explicit device index (overrides device type filter) |
 | `OLLAMA_ONNX_NPU` | `0` | Set to `1` to switch to QNN provider |
+| `OLLAMA_ORT_QNN_BACKEND_TYPE` | `htp` | QNN backend type: `htp` (NPU/Hexagon) or `cpu`. Mutually exclusive with `BACKEND_PATH`. |
+| `OLLAMA_ORT_QNN_BACKEND_PATH` | *(none)* | Path to QNN backend DLL (e.g., `QnnHtp.dll`). Mutually exclusive with `BACKEND_TYPE`. |
+| `OLLAMA_ORT_QNN_HTP_ARCH` | *(auto)* | QNN HTP architecture version (e.g., `73` for v73). Empty = auto-detect. |
+| `OLLAMA_ORT_QNN_SOC_MODEL` | *(auto)* | QNN SoC model number (e.g., `60` for Snapdragon X Elite). Empty = auto-detect. |
 
 ## Architecture
 
@@ -209,3 +213,38 @@ ls lib/ollama/ortgenai/
 Run the `npu_access_probe` tool in `_tools/` to verify your NPU has a working
 D3D12 driver. If `D3D12CreateDevice` fails for the NPU adapter, DirectML
 cannot use it and will fall back to GPU.
+
+For Snapdragon NPUs (Generic ML-only, no D3D12), use the QNN provider path
+instead: `set OLLAMA_ONNX_PROVIDER=qnn`. Run `ollama debug ortgenai` to verify.
+
+### "DML provider requested, but ... not built with DML support"
+
+Your `onnxruntime-genai.dll` is a QNN build that does not include DML. Either:
+1. Install a DML-enabled GenAI build if you need DML, or
+2. Set `OLLAMA_ONNX_PROVIDER=qnn` for Snapdragon NPU (recommended for NPU path)
+
+### "DspTransport.openSession" / "0x80000406" / QNN HTP transport errors
+
+QNN HTP failed to open a DSP session. Check with `ollama debug ortgenai`:
+1. **Missing DLLs**: Ensure `QnnHtp.dll`, `QnnSystem.dll`, `QnnHtpPrepare.dll`,
+   `QnnHtpV*Stub.dll` are all in `OLLAMA_ORT_PATH`
+2. **Transport DLLs**: Some systems require `cdsprpc.dll` — check if it's
+   shipped with your QNN SDK and copy it to `OLLAMA_ORT_PATH`
+3. **Architecture mismatch**: Try setting `OLLAMA_ORT_QNN_HTP_ARCH` and
+   `OLLAMA_ORT_QNN_SOC_MODEL` explicitly
+4. **Driver/runtime**: Ensure the Qualcomm NPU driver is installed and up to date
+
+### Two NPU paths
+
+There are two distinct NPU acceleration paths with different requirements:
+
+**Path A — D3D12/DirectML** (ggml-directml style):
+- Requires `D3D12CreateDevice()` to succeed on the NPU adapter
+- Requires DirectML device creation
+- `ollama debug npu` should show `D3D12=yes` and `DML=yes`
+
+**Path B — ORT GenAI + QNN EP** (Snapdragon NPU):
+- Does NOT require D3D12
+- Requires ORT GenAI + QNN provider DLLs + QNN backend (HTP)
+- Requires a QNN-compatible model (not a DirectML model)
+- `ollama debug ortgenai` shows provider support and missing DLLs

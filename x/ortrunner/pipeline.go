@@ -10,12 +10,29 @@ import (
 
 // Generate performs streaming token generation for a completion request.
 func (r *Runner) Generate(ctx context.Context, req Request) error {
-	maxTokens := req.Options.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = req.Options.NumPredict
+	maxNewTokens := req.Options.MaxTokens
+	if maxNewTokens == 0 {
+		maxNewTokens = req.Options.NumPredict
 	}
-	if maxTokens == 0 {
-		maxTokens = 2048
+
+	// Count prompt tokens first — needed for max_length calculation
+	promptTokens := 0
+	if tokens, err := r.tokenizer.Encode(req.Prompt); err == nil {
+		promptTokens = len(tokens)
+	}
+
+	// ORT GenAI requires a finite max_length for KV-cache allocation.
+	// Ollama uses num_predict=-1 to mean "unlimited", but GenAI cannot
+	// handle that. Compute a safe finite max_length.
+	const defaultCtx = 4096
+	numCtx := defaultCtx
+
+	var maxLength int
+	if maxNewTokens <= 0 {
+		// Unbounded or unset: generate up to full context minus prompt
+		maxLength = max(promptTokens+1, numCtx)
+	} else {
+		maxLength = max(promptTokens+1, min(numCtx, promptTokens+maxNewTokens))
 	}
 
 	params, err := oga.NewGeneratorParams(r.model)
@@ -43,7 +60,11 @@ func (r *Runner) Generate(ctx context.Context, req Request) error {
 			slog.Warn("failed to set top_k", "error", err)
 		}
 	}
-	if err := params.SetNumber("max_length", float64(maxTokens)); err != nil {
+
+	slog.Debug("ORT GenAI generation parameters",
+		"prompt_tokens", promptTokens, "max_new_tokens", maxNewTokens, "max_length", maxLength)
+
+	if err := params.SetNumber("max_length", float64(maxLength)); err != nil {
 		slog.Warn("failed to set max_length", "error", err)
 	}
 
@@ -65,12 +86,6 @@ func (r *Runner) Generate(ctx context.Context, req Request) error {
 	defer stream.Close()
 
 	promptStart := time.Now()
-	promptTokens := 0
-
-	// Count prompt tokens
-	if tokens, err := r.tokenizer.Encode(req.Prompt); err == nil {
-		promptTokens = len(tokens)
-	}
 
 	// Generate first token (includes prompt processing time)
 	if gen.IsDone() {
