@@ -45,52 +45,22 @@ func BenchmarkNPUHandler(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("could not create client: %w", err)
 	}
 
-	profiles := []struct {
-		Name     string
-		Provider string
-		EnvKey   string
-		EnvVal   string
-	}{
-		{"CPU-only", "cpu", "OLLAMA_ONNX_PROVIDER", "cpu"},
-		{"NPU-only (QNN HTP)", "qnn", "OLLAMA_ONNX_PROVIDER", "qnn"},
+	// Run benchmark — the server automatically selects the best provider
+	// (QNN for ortgenai models, auto-detect for others).
+	// Note: provider switching requires restarting the server with different
+	// env vars. For now, benchmark the model with its default provider.
+	fmt.Println("--- Benchmark ---")
+	metrics, err := runBenchEpochs(client, modelName, numCtx, numPredict, epochs, warmup)
+	if err != nil {
+		return fmt.Errorf("benchmark failed: %w", err)
 	}
 
-	var results []benchResult
+	results := []benchResult{{Provider: "default", Epochs: metrics}}
+	printProfileResults("Default provider", metrics)
+	fmt.Println()
 
-	for _, profile := range profiles {
-		fmt.Printf("--- %s ---\n", profile.Name)
-
-		// Set provider env var for this profile
-		os.Setenv(profile.EnvKey, profile.EnvVal)
-		if profile.Provider == "qnn" {
-			os.Setenv("OLLAMA_ORT_QNN_BACKEND_TYPE", "htp")
-		}
-
-		metrics, err := runBenchEpochs(client, modelName, numCtx, numPredict, epochs, warmup)
-		if err != nil {
-			fmt.Printf("  ERROR: %v\n", err)
-			fmt.Println()
-			continue
-		}
-
-		br := benchResult{Provider: profile.Provider, Epochs: metrics}
-		results = append(results, br)
-
-		printProfileResults(profile.Name, metrics)
-		fmt.Println()
-
-		// Unload model between profiles
-		unloadBenchModel(client, modelName)
-	}
-
-	// Clean up env vars
-	os.Unsetenv("OLLAMA_ONNX_PROVIDER")
-	os.Unsetenv("OLLAMA_ORT_QNN_BACKEND_TYPE")
-
-	// Print comparison table
-	if len(results) >= 2 {
-		printComparisonTable(results)
-	}
+	// Unload model
+	unloadBenchModel(client, modelName)
 
 	// Write JSON output
 	if jsonFile != "" {

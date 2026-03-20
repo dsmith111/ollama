@@ -186,6 +186,10 @@ func detectBestProvider() string {
 	if ortPath, ok := os.LookupEnv("OLLAMA_ORT_PATH"); ok {
 		searchDirs = append(searchDirs, filepath.SplitList(ortPath)...)
 	}
+	// Include the default runtime install directory
+	if installDir := DefaultRuntimeInstallDir(); installDir != "" {
+		searchDirs = append(searchDirs, installDir)
+	}
 	if exe, err := os.Executable(); err == nil {
 		if eval, err := filepath.EvalSymlinks(exe); err == nil {
 			exe = eval
@@ -216,8 +220,10 @@ func detectBestProvider() string {
 	if hasDML {
 		return "dml"
 	}
-	slog.Info("no QNN or DML provider DLLs found, defaulting to provider=dml")
-	return "dml" // ORT GenAI DML builds have DML compiled in; safe default
+	// No provider DLLs found — use CPU fallback rather than assuming DML is built in.
+	// This avoids NPU_PROVIDER_MISMATCH errors with QNN-only builds.
+	slog.Info("no QNN or DML provider DLLs found, defaulting to provider=cpu")
+	return "cpu"
 }
 
 // classifyLoadError examines an ORT GenAI model load error and returns a more

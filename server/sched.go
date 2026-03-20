@@ -306,6 +306,11 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					if pending.model.IsORTGenAI() {
 						slog.Info("ORT GenAI model detected, routing to ORT GenAI runner",
 							"model_path", pending.model.ModelPath)
+						// Use QNN provider by default for ortgenai models (QNN-optimized)
+						if s.loadORTGenAIQNN(pending) {
+							break
+						}
+						// Fall back to auto-detect if QNN fails
 						if s.loadORTGenAI(pending) {
 							break
 						}
