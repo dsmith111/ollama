@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ollama/ollama/api"
@@ -22,11 +21,6 @@ type Runner struct {
 	modelDir  string
 
 	Requests chan Request
-
-	// Draft model state for speculative decoding
-	draftMu     sync.Mutex
-	draftGen    *oga.Generator
-	draftParams *oga.GeneratorParams
 }
 
 // Request represents a completion request.
@@ -393,17 +387,6 @@ func ValidateORTDir() ORTDirReport {
 
 // Close frees all ORT GenAI resources.
 func (r *Runner) Close() {
-	r.draftMu.Lock()
-	if r.draftGen != nil {
-		r.draftGen.Close()
-		r.draftGen = nil
-	}
-	if r.draftParams != nil {
-		r.draftParams.Close()
-		r.draftParams = nil
-	}
-	r.draftMu.Unlock()
-
 	if r.tokenizer != nil {
 		r.tokenizer.Close()
 	}
@@ -413,113 +396,4 @@ func (r *Runner) Close() {
 	if r.config != nil {
 		r.config.Close()
 	}
-}
-
-// DraftInit initializes the draft session with a text prompt.
-// Destroys any existing generator and creates a fresh one.
-func (r *Runner) DraftInit(promptText string) error {
-	r.draftMu.Lock()
-	defer r.draftMu.Unlock()
-
-	// Clean up existing draft state
-	if r.draftGen != nil {
-		r.draftGen.Close()
-		r.draftGen = nil
-	}
-	if r.draftParams != nil {
-		r.draftParams.Close()
-		r.draftParams = nil
-	}
-
-	params, err := oga.NewGeneratorParams(r.model)
-	if err != nil {
-		return err
-	}
-	r.draftParams = params
-
-	if err := params.SetBool("do_sample", false); err != nil {
-		slog.Warn("draft: failed to set do_sample=false", "error", err)
-	}
-
-	gen, err := oga.NewGenerator(r.model, params)
-	if err != nil {
-		params.Close()
-		r.draftParams = nil
-		return err
-	}
-
-	// Append the prompt tokens via tokenizer encoding
-	if err := gen.AppendTokenSequencesFromEncoding(r.tokenizer, promptText); err != nil {
-		gen.Close()
-		params.Close()
-		r.draftParams = nil
-		return err
-	}
-	r.draftGen = gen
-
-	slog.Debug("draft session initialized", "prompt_len", len(promptText))
-	return nil
-}
-
-// DraftPropose generates up to k tokens greedily from the draft model.
-func (r *Runner) DraftPropose(k int) ([]int32, error) {
-	r.draftMu.Lock()
-	defer r.draftMu.Unlock()
-
-	if r.draftGen == nil {
-		return nil, nil
-	}
-
-	var proposed []int32
-	for i := 0; i < k; i++ {
-		if r.draftGen.IsDone() {
-			break
-		}
-		if err := r.draftGen.GenerateNextToken(); err != nil {
-			slog.Warn("draft: generate next token failed", "error", err, "step", i)
-			break
-		}
-		tokens, err := r.draftGen.GetNextTokens()
-		if err != nil || len(tokens) == 0 {
-			break
-		}
-		proposed = append(proposed, tokens[0])
-	}
-
-	slog.Debug("draft proposed tokens", "count", len(proposed))
-	return proposed, nil
-}
-
-// DraftAccept handles verification results. If all proposed tokens were accepted,
-// no reset is needed. If some were rejected, we destroy the generator and recreate
-// with the accepted context (since OGA has no KV cache rewind).
-func (r *Runner) DraftAccept(acceptedCount, lastProposedCount int, correctionToken int32) error {
-	r.draftMu.Lock()
-	defer r.draftMu.Unlock()
-
-	if r.draftGen == nil {
-		return nil
-	}
-
-	if acceptedCount == lastProposedCount {
-		// All accepted — draft generator KV cache is already in the right state
-		// Just append accepted tokens + correction to context
-		// The correction token will be handled on next DraftInit or Propose
-		return nil
-	}
-
-	// Partial accept: need to reset generator with correct context
-	r.draftGen.Close()
-	r.draftGen = nil
-	if r.draftParams != nil {
-		r.draftParams.Close()
-		r.draftParams = nil
-	}
-
-	// Build new context: on partial accept we just wait for the next DraftInit
-	// which will be called with the full correct context
-
-	slog.Debug("draft accept: partial, generator reset",
-		"accepted", acceptedCount, "proposed", lastProposedCount)
-	return nil
 }

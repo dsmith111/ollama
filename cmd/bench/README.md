@@ -68,6 +68,7 @@ benchstat -col /name gemma.bench
 | -model	| Comma-separated list of models to benchmark	| (required)		|
 | -epochs	| Number of iterations per model		| 6			|
 | -max-tokens	| Maximum tokens for model response		| 200			|
+| -num-ctx	| Context length (num_ctx); recommended for ORT GenAI	| 0 (not set)		|
 | -temperature	| Temperature parameter				| 0.0			|
 | -seed		| Random seed					| 0 (random)		|
 | -timeout	| Timeout in seconds				| 300			|
@@ -141,3 +142,15 @@ Additionally, the model info comment line (displayed once per model before epoch
  * **Family**: Model family (e.g., gemma3)
  * **Size**: Total model memory in bytes
  * **VRAM**: GPU memory used by the loaded model (when Size > VRAM, the difference is CPU spill)
+
+## NPU Benchmarking
+
+For NPU (ORT GenAI) models, **always set `-num-ctx`** to avoid KV allocation errors:
+
+```
+./ollama-bench -model phi3:mini -epochs 8 -num-ctx 512 -prompt-tokens 512 -max-tokens 128
+```
+
+For automated CPU vs NPU comparisons, use the `scripts/bench-npu.ps1` script
+which manages separate `ollama serve` instances with different env vars per
+profile and runs cold + warm benchmarks. See `x/ortrunner/README.md` for details.

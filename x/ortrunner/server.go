@@ -139,58 +139,6 @@ func Execute(args []string) error {
 		json.NewEncoder(w).Encode(intTokens)
 	})
 
-	// Draft model endpoints for speculative decoding
-	mux.HandleFunc("POST /internal/draft/init", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Prompt string `json:"prompt"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			return
-		}
-		if err := runner.DraftInit(body.Prompt); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
-
-	mux.HandleFunc("POST /internal/draft/propose", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			K int `json:"k"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			return
-		}
-		tokens, err := runner.DraftPropose(body.K)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		json.NewEncoder(w).Encode(struct {
-			Tokens []int32 `json:"tokens"`
-			Count  int     `json:"count"`
-		}{Tokens: tokens, Count: len(tokens)})
-	})
-
-	mux.HandleFunc("POST /internal/draft/accept", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			AcceptedCount     int   `json:"accepted_count"`
-			LastProposedCount int   `json:"last_proposed_count"`
-			CorrectionToken   int32 `json:"correction_token"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			return
-		}
-		if err := runner.DraftAccept(body.AcceptedCount, body.LastProposedCount, body.CorrectionToken); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
-
 	// Redirects for compatibility with the standard runner protocol
 	for source, target := range map[string]string{
 		"GET /health": "/v1/status",

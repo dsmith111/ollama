@@ -224,7 +224,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 
 					// NPU acceleration validation
 					accelMode := envconfig.AccelMode()
-					if accelMode == "npu" || accelMode == "npu_assist" {
+					if accelMode == "npu" {
 						provider := os.Getenv("OLLAMA_ONNX_PROVIDER")
 
 						// Determine which NPU path to validate based on provider config
@@ -261,13 +261,8 @@ func (s *Scheduler) processPending(ctx context.Context) {
 									pending.errCh <- fmt.Errorf("OLLAMA_ACCEL_MODE=%s but NPU unavailable for D3D12/DML: %w", accelMode, d3d12Err)
 									break
 								}
-								if accelMode == "npu_assist" {
-									slog.Warn("NPU preflight validation failed for npu_assist (D3D12/DML path)",
-										"error", d3d12Err)
-								} else {
-									slog.Warn("NPU D3D12/DML validation failed, falling back to default device",
-										"accel_mode", accelMode, "error", d3d12Err)
-								}
+								slog.Warn("NPU D3D12/DML validation failed, falling back to default device",
+									"accel_mode", accelMode, "error", d3d12Err)
 							} else {
 								slog.Info("NPU validated for D3D12/DML acceleration",
 									"accel_mode", accelMode,
@@ -310,7 +305,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					// Check for ONNX models — use ORT GenAI runner for NPU/GPU inference
 					if pending.model.IsONNX() {
 						// If NPU acceleration is requested, route with NPU targeting
-						if accelMode == "npu" || accelMode == "npu_assist" {
+						if accelMode == "npu" {
 							slog.Info("NPU acceleration requested for ONNX model, targeting NPU",
 								"accel_mode", accelMode)
 							if s.loadORTGenAINPU(pending) {
@@ -338,7 +333,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					}
 
 					// For GGUF models with NPU acceleration: ensure DirectML is enabled
-					if (accelMode == "npu" || accelMode == "npu_assist") && !envconfig.EnableDirectML() {
+					if accelMode == "npu" && !envconfig.EnableDirectML() {
 						slog.Info("OLLAMA_ACCEL_MODE requires DirectML, enabling implicitly",
 							"accel_mode", accelMode)
 						os.Setenv("OLLAMA_DIRECTML", "1")

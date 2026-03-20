@@ -20,6 +20,7 @@ type flagOptions struct {
 	models       *string
 	epochs       *int
 	maxTokens    *int
+	numCtx       *int
 	temperature  *float64
 	seed         *int
 	timeout      *int
@@ -83,6 +84,9 @@ func generatePromptForTokenCount(targetTokens int, epoch int) string {
 
 func buildGenerateRequest(model string, fOpt flagOptions, imgData api.ImageData, epoch int) *api.GenerateRequest {
 	options := make(map[string]interface{})
+	if fOpt.numCtx != nil && *fOpt.numCtx > 0 {
+		options["num_ctx"] = *fOpt.numCtx
+	}
 	if *fOpt.maxTokens > 0 {
 		options["num_predict"] = *fOpt.maxTokens
 	}
@@ -247,7 +251,7 @@ func BenchmarkModel(fOpt flagOptions) error {
 
 	var out io.Writer = os.Stdout
 	if fOpt.outputFile != nil && *fOpt.outputFile != "" {
-		f, err := os.OpenFile(*fOpt.outputFile, os.O_CREATE|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(*fOpt.outputFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: cannot open output file %s: %v\n", *fOpt.outputFile, err)
 			return err
@@ -467,6 +471,7 @@ func main() {
 		models:       flag.String("model", "", "Model to benchmark"),
 		epochs:       flag.Int("epochs", 6, "Number of epochs (iterations) per model"),
 		maxTokens:    flag.Int("max-tokens", 200, "Maximum tokens for model response"),
+		numCtx:       flag.Int("num-ctx", 0, "Context length (num_ctx). Strongly recommended for ORT GenAI (e.g. 512)"),
 		temperature:  flag.Float64("temperature", 0, "Temperature parameter"),
 		seed:         flag.Int("seed", 0, "Random seed"),
 		timeout:      flag.Int("timeout", 60*5, "Timeout in seconds (default 300s)"),

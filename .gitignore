@@ -28,5 +28,9 @@ lib/ollama/*.dll
 
 # Compiled tool binaries (source is tracked, binaries are not)
 _tools/*.exe
+
+# Benchmark results
+results-*/
+
 _tools/*.obj
 _tools/*.pdb
