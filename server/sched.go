@@ -302,6 +302,16 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						continue
 					}
 
+					// Check for ORT GenAI packaged models (from ollama create)
+					if pending.model.IsORTGenAI() {
+						slog.Info("ORT GenAI model detected, routing to ORT GenAI runner",
+							"model_path", pending.model.ModelPath)
+						if s.loadORTGenAI(pending) {
+							break
+						}
+						continue
+					}
+
 					// Check for ONNX models — use ORT GenAI runner for NPU/GPU inference
 					if pending.model.IsONNX() {
 						// If NPU acceleration is requested, route with NPU targeting

@@ -25,14 +25,21 @@ func (r *Runner) Generate(ctx context.Context, req Request) error {
 	// Ollama uses num_predict=-1 to mean "unlimited", but GenAI cannot
 	// handle that. Compute a safe finite max_length.
 	const defaultCtx = 4096
-	numCtx := defaultCtx
+	const defaultPredict = 128
+	numCtx := req.Options.NumCtx
+	if numCtx <= 0 {
+		numCtx = defaultCtx
+	}
 
-	var maxLength int
+	// If num_predict is unlimited (-1) or unset (0), use a safe default
 	if maxNewTokens <= 0 {
-		// Unbounded or unset: generate up to full context minus prompt
-		maxLength = max(promptTokens+1, numCtx)
-	} else {
-		maxLength = max(promptTokens+1, min(numCtx, promptTokens+maxNewTokens))
+		maxNewTokens = defaultPredict
+	}
+
+	// Compute max_length: prompt + new tokens, capped by context size
+	maxLength := min(numCtx, promptTokens+maxNewTokens)
+	if maxLength < promptTokens+1 {
+		maxLength = promptTokens + 1
 	}
 
 	params, err := oga.NewGeneratorParams(r.model)

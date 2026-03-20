@@ -2335,6 +2335,47 @@ func NewCLI() *cobra.Command {
 		RunE:  DebugORTGenAIHandler,
 	})
 
+	// npu command group
+	npuCmd := &cobra.Command{
+		Use:   "npu",
+		Short: "NPU runtime management and diagnostics",
+	}
+	npuSetupCmd := &cobra.Command{
+		Use:   "setup",
+		Short: "Install ORT GenAI runtime for NPU inference",
+		RunE:  NPUSetupHandler,
+	}
+	npuSetupCmd.Flags().String("provider", "auto", "Execution provider: auto, qnn, dml, cpu")
+	npuSetupCmd.Flags().Bool("force", false, "Re-download even if already installed")
+	npuSetupCmd.Flags().Bool("print-path", false, "Print install directory and exit")
+	npuSetupCmd.Flags().Bool("validate-only", false, "Run validation checks without installing")
+	npuCmd.AddCommand(npuSetupCmd)
+	npuCmd.AddCommand(&cobra.Command{
+		Use:   "doctor",
+		Short: "Diagnose NPU health and ORT GenAI readiness",
+		RunE:  NPUDoctorHandler,
+	})
+
+	// benchmark command group
+	benchmarkCmd := &cobra.Command{
+		Use:   "benchmark",
+		Short: "Benchmark models",
+	}
+	benchmarkNPUCmd := &cobra.Command{
+		Use:    "npu",
+		Short:  "Compare CPU vs NPU inference performance",
+		RunE:   BenchmarkNPUHandler,
+		PreRunE: checkServerHeartbeat,
+	}
+	benchmarkNPUCmd.Flags().String("model", "", "Model to benchmark (required)")
+	benchmarkNPUCmd.Flags().Int("ctx", 512, "Context length (num_ctx)")
+	benchmarkNPUCmd.Flags().Int("predict", 128, "Max tokens to generate")
+	benchmarkNPUCmd.Flags().Int("epochs", 8, "Number of timed epochs")
+	benchmarkNPUCmd.Flags().Int("warmup", 1, "Number of warmup epochs")
+	benchmarkNPUCmd.Flags().String("json", "", "Write JSON results to file")
+	_ = benchmarkNPUCmd.MarkFlagRequired("model")
+	benchmarkCmd.AddCommand(benchmarkNPUCmd)
+
 	rootCmd.AddCommand(
 		serveCmd,
 		createCmd,
@@ -2353,6 +2394,8 @@ func NewCLI() *cobra.Command {
 		deleteCmd,
 		runnerCmd,
 		debugCmd,
+		npuCmd,
+		benchmarkCmd,
 		launch.LaunchCmd(checkServerHeartbeat, runInteractiveTUI),
 	)
 

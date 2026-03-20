@@ -1023,4 +1023,175 @@ func TestDetectModelTypeFromFiles(t *testing.T) {
 			t.Fatalf("expected empty model type for small file, got %q", modelType)
 		}
 	})
+
+	t.Run("ortgenai model (onnx + genai_config.json)", func(t *testing.T) {
+		files := map[string]string{
+			"embeddings.onnx":    "sha256:aaa111",
+			"lm_head.onnx":      "sha256:bbb222",
+			"genai_config.json":  "sha256:ccc333",
+			"tokenizer.json":    "sha256:ddd444",
+			"tokenizer.model":   "sha256:eee555",
+		}
+
+		modelType := detectModelTypeFromFiles(files)
+		if modelType != "ortgenai" {
+			t.Fatalf("expected model type 'ortgenai', got %q", modelType)
+		}
+	})
+
+	t.Run("onnx without genai_config is not ortgenai", func(t *testing.T) {
+		p := t.TempDir()
+		t.Setenv("OLLAMA_MODELS", p)
+
+		data := []byte("fake onnx data")
+		digest := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+		if err := os.MkdirAll(filepath.Join(p, "blobs"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Create(filepath.Join(p, "blobs", fmt.Sprintf("sha256-%s", strings.TrimPrefix(digest, "sha256:"))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Write(data)
+		f.Close()
+
+		files := map[string]string{
+			"model.onnx":      digest,
+			"tokenizer.json":  "sha256:abc",
+		}
+
+		modelType := detectModelTypeFromFiles(files)
+		if modelType == "ortgenai" {
+			t.Fatal("should not detect as ortgenai without genai_config.json")
+		}
+	})
+
+	t.Run("only json and bin files is not ortgenai", func(t *testing.T) {
+		p := t.TempDir()
+		t.Setenv("OLLAMA_MODELS", p)
+
+		data := []byte("not gguf")
+		digest := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+		if err := os.MkdirAll(filepath.Join(p, "blobs"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Create(filepath.Join(p, "blobs", fmt.Sprintf("sha256-%s", strings.TrimPrefix(digest, "sha256:"))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Write(data)
+		f.Close()
+
+		files := map[string]string{
+			"config.json":     digest,
+			"weights.bin":     digest,
+		}
+
+		modelType := detectModelTypeFromFiles(files)
+		if modelType == "ortgenai" {
+			t.Fatal("should not detect bin+json as ortgenai")
+		}
+	})
+}
+
+func TestConvertFromORTGenAI(t *testing.T) {
+	p := t.TempDir()
+	t.Setenv("OLLAMA_MODELS", p)
+
+	if err := os.MkdirAll(filepath.Join(p, "blobs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create fake blob files
+	makeBlob := func(content string) string {
+		data := []byte(content)
+		digest := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+		blobName := fmt.Sprintf("sha256-%s", strings.TrimPrefix(digest, "sha256:"))
+		if err := os.WriteFile(filepath.Join(p, "blobs", blobName), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return digest
+	}
+
+	files := map[string]string{
+		"embeddings.onnx":   makeBlob("fake onnx graph 1"),
+		"lm_head.onnx":     makeBlob("fake onnx graph 2"),
+		"genai_config.json": makeBlob(`{"model_type": "phi3"}`),
+		"tokenizer.json":   makeBlob(`{"version": "1.0"}`),
+		"tokenizer.model":  makeBlob("sentencepiece model data"),
+	}
+
+	t.Run("successful packaging", func(t *testing.T) {
+		layers, err := convertFromORTGenAI(files, func(resp api.ProgressResponse) {})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(layers) != len(files) {
+			t.Fatalf("expected %d layers, got %d", len(files), len(layers))
+		}
+
+		// Verify all layers have the ortgenai media type
+		for _, layer := range layers {
+			if layer.MediaType != MediaTypeORTGenAI {
+				t.Errorf("expected media type %q, got %q", MediaTypeORTGenAI, layer.MediaType)
+			}
+			if layer.Name == "" {
+				t.Error("layer missing filename in Name field")
+			}
+		}
+
+		// Verify filenames are preserved
+		names := make(map[string]bool)
+		for _, layer := range layers {
+			names[layer.Name] = true
+		}
+		for filename := range files {
+			if !names[filepath.Base(filename)] {
+				t.Errorf("expected filename %q in layers", filepath.Base(filename))
+			}
+		}
+	})
+
+	t.Run("missing onnx file", func(t *testing.T) {
+		badFiles := map[string]string{
+			"genai_config.json": makeBlob(`{}`),
+			"tokenizer.json":   makeBlob(`{}`),
+		}
+		_, err := convertFromORTGenAI(badFiles, func(resp api.ProgressResponse) {})
+		if err == nil {
+			t.Fatal("expected error for missing onnx file")
+		}
+		if !strings.Contains(err.Error(), "*.onnx") {
+			t.Errorf("expected error mentioning *.onnx, got: %v", err)
+		}
+	})
+
+	t.Run("missing genai_config.json", func(t *testing.T) {
+		badFiles := map[string]string{
+			"model.onnx":      makeBlob("onnx data"),
+			"tokenizer.json":  makeBlob(`{}`),
+		}
+		_, err := convertFromORTGenAI(badFiles, func(resp api.ProgressResponse) {})
+		if err == nil {
+			t.Fatal("expected error for missing genai_config.json")
+		}
+		if !strings.Contains(err.Error(), "genai_config.json") {
+			t.Errorf("expected error mentioning genai_config.json, got: %v", err)
+		}
+	})
+
+	t.Run("missing tokenizer", func(t *testing.T) {
+		badFiles := map[string]string{
+			"model.onnx":       makeBlob("onnx data"),
+			"genai_config.json": makeBlob(`{}`),
+		}
+		_, err := convertFromORTGenAI(badFiles, func(resp api.ProgressResponse) {})
+		if err == nil {
+			t.Fatal("expected error for missing tokenizer")
+		}
+		if !strings.Contains(err.Error(), "tokenizer") {
+			t.Errorf("expected error mentioning tokenizer, got: %v", err)
+		}
+	})
 }

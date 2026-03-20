@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -44,7 +46,14 @@ func Execute(args []string) error {
 	runner := Runner{
 		Requests: make(chan Request),
 	}
+	// Ensure OGA resources are destroyed before global shutdown.
+	// Order matters: destroy objects first, then call OgaShutdown.
+	defer oga.Shutdown()
 	defer runner.Close()
+
+	// Set up signal handling for graceful shutdown
+	sigCtx, sigCancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer sigCancel()
 
 	slog.Info("loading ORT GenAI model", "dir", modelDir)
 	if err := runner.Load(modelDir); err != nil {
@@ -148,7 +157,28 @@ func Execute(args []string) error {
 	}
 
 	// Run the request processing loop and HTTP server
-	g, ctx := errgroup.WithContext(context.Background())
+	g, ctx := errgroup.WithContext(sigCtx)
+
+	server := &http.Server{
+		Addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			recorder := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
+			t := time.Now()
+			mux.ServeHTTP(recorder, r)
+
+			var level slog.Level
+			switch {
+			case recorder.code >= 500:
+				level = slog.LevelError
+			case recorder.code >= 400:
+				level = slog.LevelWarn
+			case recorder.code >= 300:
+				return
+			}
+			slog.Log(r.Context(), level, "ServeHTTP", "method", r.Method, "path", r.URL.Path, "took", time.Since(t), "status", recorder.Status())
+		}),
+	}
 
 	g.Go(func() error {
 		for {
@@ -176,25 +206,20 @@ func Execute(args []string) error {
 	})
 
 	g.Go(func() error {
-		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-		slog.Info("ORT GenAI runner listening", "addr", addr)
-		return http.ListenAndServe(addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			recorder := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
-			t := time.Now()
-			mux.ServeHTTP(recorder, r)
+		slog.Info("ORT GenAI runner listening", "addr", server.Addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return err
+		}
+		return nil
+	})
 
-			var level slog.Level
-			switch {
-			case recorder.code >= 500:
-				level = slog.LevelError
-			case recorder.code >= 400:
-				level = slog.LevelWarn
-			case recorder.code >= 300:
-				return
-			}
-			slog.Log(r.Context(), level, "ServeHTTP", "method", r.Method, "path", r.URL.Path, "took", time.Since(t), "status", recorder.Status())
-		}))
+	// Graceful shutdown: when context is cancelled (signal), shut down HTTP server
+	g.Go(func() error {
+		<-ctx.Done()
+		slog.Info("shutting down ORT GenAI runner")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return server.Shutdown(shutdownCtx)
 	})
 
 	return g.Wait()

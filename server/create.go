@@ -348,47 +348,128 @@ func convertModelFromFiles(files map[string]string, baseLayers []*layerGGML, isA
 			allLayers = append(allLayers, layers...)
 		}
 		return allLayers, nil
+	case "ortgenai":
+		layers, err := convertFromORTGenAI(files, fn)
+		if err != nil {
+			return nil, err
+		}
+		return layers, nil
 	default:
 		return nil, errUnknownType
 	}
 }
 
 func detectModelTypeFromFiles(files map[string]string) string {
+	hasONNX := false
+	hasGenAIConfig := false
+
 	for fn := range files {
 		if strings.HasSuffix(fn, ".safetensors") {
 			return "safetensors"
 		} else if strings.HasSuffix(fn, ".gguf") {
 			return "gguf"
-		} else {
-			// try to see if we can find a gguf file even without the file extension
-			blobPath, err := manifest.BlobsPath(files[fn])
-			if err != nil {
-				slog.Error("error getting blobs path", "file", fn)
-				return ""
-			}
+		}
 
-			f, err := os.Open(blobPath)
-			if err != nil {
-				slog.Error("error reading file", "error", err)
-				return ""
-			}
-			defer f.Close()
+		if strings.HasSuffix(fn, ".onnx") {
+			hasONNX = true
+		}
+		if filepath.Base(fn) == "genai_config.json" {
+			hasGenAIConfig = true
+		}
+	}
 
-			buf := make([]byte, 4)
-			_, err = f.Read(buf)
-			if err != nil {
-				slog.Error("error reading file", "error", err)
-				return ""
-			}
+	// ORT GenAI model: has .onnx files + genai_config.json
+	if hasONNX && hasGenAIConfig {
+		return "ortgenai"
+	}
 
-			ct := ggml.DetectContentType(buf)
-			if ct == "gguf" {
-				return "gguf"
-			}
+	// Fall back to GGUF detection by magic bytes
+	for fn := range files {
+		if strings.HasSuffix(fn, ".safetensors") || strings.HasSuffix(fn, ".gguf") || strings.HasSuffix(fn, ".onnx") {
+			continue
+		}
+
+		blobPath, err := manifest.BlobsPath(files[fn])
+		if err != nil {
+			slog.Error("error getting blobs path", "file", fn)
+			return ""
+		}
+
+		f, err := os.Open(blobPath)
+		if err != nil {
+			slog.Error("error reading file", "error", err)
+			return ""
+		}
+		defer f.Close()
+
+		buf := make([]byte, 4)
+		_, err = f.Read(buf)
+		if err != nil {
+			slog.Error("error reading file", "error", err)
+			return ""
+		}
+
+		ct := ggml.DetectContentType(buf)
+		if ct == "gguf" {
+			return "gguf"
 		}
 	}
 
 	return ""
+}
+
+const MediaTypeORTGenAI = "application/vnd.ollama.image.ortgenai"
+
+// convertFromORTGenAI packages an ORT GenAI model directory as manifest layers.
+// No conversion is performed — the ONNX files, configs, and tokenizer files are
+// stored as-is in the blob store.
+func convertFromORTGenAI(files map[string]string, fn func(resp api.ProgressResponse)) ([]*layerGGML, error) {
+	// Validate required files
+	var hasONNX, hasGenAIConfig, hasTokenizer bool
+	for filename := range files {
+		base := filepath.Base(filename)
+		switch {
+		case strings.HasSuffix(base, ".onnx"):
+			hasONNX = true
+		case base == "genai_config.json":
+			hasGenAIConfig = true
+		case base == "tokenizer.model" || base == "tokenizer.json":
+			hasTokenizer = true
+		}
+	}
+
+	var missing []string
+	if !hasONNX {
+		missing = append(missing, "*.onnx")
+	}
+	if !hasGenAIConfig {
+		missing = append(missing, "genai_config.json")
+	}
+	if !hasTokenizer {
+		missing = append(missing, "tokenizer.model or tokenizer.json")
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("ORT GenAI folder detected, but missing required files: %s", strings.Join(missing, ", "))
+	}
+
+	fn(api.ProgressResponse{Status: "packaging ORT GenAI model"})
+
+	var layers []*layerGGML
+	for filename, digest := range files {
+		layer, err := manifest.NewLayerFromLayer(digest, MediaTypeORTGenAI, "")
+		if err != nil {
+			return nil, fmt.Errorf("creating layer for %s: %w", filename, err)
+		}
+
+		// Store the original filename so we can reconstruct the directory at runtime.
+		// The Layer.Name field is serialized as "name" in the manifest JSON.
+		layer.Name = filepath.Base(filename)
+
+		layers = append(layers, &layerGGML{layer, nil})
+	}
+
+	slog.Info("packaged ORT GenAI model", "files", len(layers))
+	return layers, nil
 }
 
 func convertFromSafetensors(files map[string]string, baseLayers []*layerGGML, isAdapter bool, fn func(resp api.ProgressResponse)) ([]*layerGGML, error) {
@@ -485,8 +566,11 @@ func kvFromLayers(baseLayers []*layerGGML) (ofs.Config, error) {
 
 func createModel(r api.CreateRequest, name model.Name, baseLayers []*layerGGML, config *model.ConfigV2, fn func(resp api.ProgressResponse)) (err error) {
 	var layers []manifest.Layer
+	hasORTGenAI := false
 	for _, layer := range baseLayers {
-		if layer.GGML != nil {
+		if layer.MediaType == MediaTypeORTGenAI {
+			hasORTGenAI = true
+		} else if layer.GGML != nil {
 			quantType := strings.ToUpper(cmp.Or(r.Quantize, r.Quantization))
 			if quantType != "" && layer.GGML.Name() == "gguf" && layer.MediaType == "application/vnd.ollama.image.model" {
 				want, err := ggml.ParseFileType(quantType)
@@ -511,6 +595,15 @@ func createModel(r api.CreateRequest, name model.Name, baseLayers []*layerGGML, 
 			config.ModelFamilies = append(config.ModelFamilies, layer.GGML.KV().Architecture())
 		}
 		layers = append(layers, layer.Layer)
+	}
+
+	// Set config for ORT GenAI models (no GGML KV metadata available)
+	if hasORTGenAI {
+		config.ModelFormat = cmp.Or(config.ModelFormat, "ortgenai")
+		config.FileType = cmp.Or(config.FileType, "onnx")
+		if len(config.Capabilities) == 0 {
+			config.Capabilities = []string{"completion"}
+		}
 	}
 
 	if r.Template != "" {

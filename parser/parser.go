@@ -292,6 +292,12 @@ func filesForModel(path string) ([]string, error) {
 	} else if gg, _ := glob(filepath.Join(path, "*.gguf"), "application/octet-stream"); len(gg) > 0 {
 		// covers gguf files ending in .gguf
 		files = append(files, gg...)
+	} else if onnx, _ := glob(filepath.Join(path, "*.onnx"), ""); len(onnx) > 0 {
+		// ORT GenAI model: *.onnx graphs + QNN context binary caches (*.bin)
+		files = append(files, onnx...)
+		if bins, _ := glob(filepath.Join(path, "*.bin"), ""); len(bins) > 0 {
+			files = append(files, bins...)
+		}
 	} else if gg, _ := glob(filepath.Join(path, "*.bin"), "application/octet-stream"); len(gg) > 0 {
 		// covers gguf files ending in .bin
 		files = append(files, gg...)
@@ -321,6 +327,11 @@ func filesForModel(path string) ([]string, error) {
 	} else if tks, _ := glob(filepath.Join(path, "**/tokenizer.model"), "text/plain"); len(tks) > 0 {
 		// some times tokenizer.model is in a subdirectory (e.g. meta-llama/Meta-Llama-3-8B)
 		files = append(files, tks...)
+	}
+
+	// add Jinja chat templates (used by ORT GenAI models)
+	if jinja, _ := glob(filepath.Join(path, "*.jinja"), ""); len(jinja) > 0 {
+		files = append(files, jinja...)
 	}
 
 	return files, nil

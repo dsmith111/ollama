@@ -83,6 +83,10 @@ func (m *Model) IsGenAIQNN() bool {
 	return m.Config.ModelFormat == "genai-qnn"
 }
 
+func (m *Model) IsORTGenAI() bool {
+	return m.Config.ModelFormat == "ortgenai"
+}
+
 // Capabilities returns the capabilities that the model supports
 func (m *Model) Capabilities() []model.Capability {
 	capabilities := []model.Capability{}
@@ -321,6 +325,8 @@ func GetModel(name string) (*Model, error) {
 		case "application/vnd.ollama.image.model":
 			m.ModelPath = filename
 			m.ParentModel = layer.From
+		case MediaTypeORTGenAI:
+			// ORT GenAI layers are handled after the loop via materialization
 		case "application/vnd.ollama.image.embed":
 			// Deprecated in versions  > 0.1.2
 			// TODO: remove this warning in a future version
@@ -375,6 +381,15 @@ func GetModel(name string) (*Model, error) {
 			}
 			m.License = append(m.License, string(bts))
 		}
+	}
+
+	// For ORT GenAI models, materialize the model directory from blob layers
+	if m.Config.ModelFormat == "ortgenai" && m.ModelPath == "" {
+		modelDir, err := materializeORTGenAIDir(mf)
+		if err != nil {
+			return nil, fmt.Errorf("materialize ORT GenAI model: %w", err)
+		}
+		m.ModelPath = modelDir
 	}
 
 	return m, nil

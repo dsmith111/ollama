@@ -82,6 +82,11 @@ func NewClient(modelDir string) (*Client, error) {
 			libraryPaths = append(libraryPaths, filepath.SplitList(ortPath)...)
 		}
 
+		// Add default runtime install directory
+		if installDir := DefaultRuntimeInstallDir(); installDir != "" {
+			libraryPaths = append(libraryPaths, installDir)
+		}
+
 		// Add lib/ollama paths
 		if ml.LibOllamaPath != "" {
 			libraryPaths = append(libraryPaths, ml.LibOllamaPath)
@@ -215,6 +220,10 @@ func NewClientWithOpts(opts ClientOptions) (*Client, error) {
 		var libraryPaths []string
 		if ortPath, ok := os.LookupEnv("OLLAMA_ORT_PATH"); ok {
 			libraryPaths = append(libraryPaths, filepath.SplitList(ortPath)...)
+		}
+		// Add default runtime install directory
+		if installDir := DefaultRuntimeInstallDir(); installDir != "" {
+			libraryPaths = append(libraryPaths, installDir)
 		}
 		if ml.LibOllamaPath != "" {
 			libraryPaths = append(libraryPaths, ml.LibOllamaPath)
@@ -351,6 +360,7 @@ func (c *Client) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 			TopP:        req.Options.TopP,
 			TopK:        req.Options.TopK,
 			NumPredict:  req.Options.NumPredict,
+			NumCtx:      req.Options.NumCtx,
 		}
 	}
 
@@ -530,4 +540,5 @@ type completionOpts struct {
 	TopP        float32 `json:"top_p,omitempty"`
 	TopK        int     `json:"top_k,omitempty"`
 	NumPredict  int     `json:"num_predict,omitempty"`
+	NumCtx      int     `json:"num_ctx,omitempty"`
 }

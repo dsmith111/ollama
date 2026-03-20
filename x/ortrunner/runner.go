@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -39,6 +40,7 @@ type TextCompletionsRequest struct {
 		TopK        int     `json:"top_k"`
 		MaxTokens   int     `json:"max_tokens"`
 		NumPredict  int     `json:"num_predict"`
+		NumCtx      int     `json:"num_ctx"`
 	} `json:"options"`
 }
 
@@ -294,6 +296,10 @@ func ortSearchDirs() []string {
 	if ortPath, ok := os.LookupEnv("OLLAMA_ORT_PATH"); ok {
 		dirs = append(dirs, filepath.SplitList(ortPath)...)
 	}
+	// Include the default runtime install directory
+	if installDir := DefaultRuntimeInstallDir(); installDir != "" {
+		dirs = append(dirs, installDir)
+	}
 	if exe, err := os.Executable(); err == nil {
 		if eval, err := filepath.EvalSymlinks(exe); err == nil {
 			exe = eval
@@ -301,6 +307,19 @@ func ortSearchDirs() []string {
 		dirs = append(dirs, filepath.Dir(exe))
 	}
 	return dirs
+}
+
+// DefaultRuntimeInstallDir returns the standard per-user install directory
+// for the ORT GenAI runtime bundle on Windows.
+func DefaultRuntimeInstallDir() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	localAppData := os.Getenv("LOCALAPPDATA")
+	if localAppData == "" {
+		return ""
+	}
+	return filepath.Join(localAppData, "Ollama", "runtimes", "ortgenai", "win-arm64-qnn", "0.12.2_1.24.1")
 }
 
 // ORTDirReport describes the contents and health of an ORT runtime directory.
