@@ -91,7 +91,17 @@ func (m *Model) IsORTGenAI() bool {
 func (m *Model) Capabilities() []model.Capability {
 	capabilities := []model.Capability{}
 
-	if m.ModelPath != "" {
+	// ORT GenAI models don't have GGUF metadata — use config capabilities
+	if m.IsORTGenAI() || m.IsONNX() || m.IsGenAIQNN() {
+		if len(m.Config.Capabilities) > 0 {
+			for _, c := range m.Config.Capabilities {
+				capabilities = append(capabilities, model.Capability(c))
+			}
+		} else {
+			// Default: ORT GenAI models support completion
+			capabilities = append(capabilities, model.CapabilityCompletion)
+		}
+	} else if m.ModelPath != "" {
 		f, err := gguf.Open(m.ModelPath)
 		if err == nil {
 			defer f.Close()
